@@ -1,0 +1,371 @@
+# Deploy a Drafter v2 application to GitHub Pages.
+# Based on the Drafter v2 GitHub Actions deployment model, with a small
+# course-oriented diagnostics dashboard retained from the previous workflow.
+name: Deploy main branch as website
+
+on:
+  # Keep deployment manual, matching the existing course workflow.
+  # To deploy on every push as in the Drafter v2 extension guide, also add:
+  # push:
+  #   branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only the newest deployment should finish if two are started close together.
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+env:
+  # Stay on Drafter v2 while still receiving v2 bug fixes.
+  # For semester-level reproducibility, replace this with an exact version,
+  # for example: drafter==2.0.2
+  DRAFTER_SPEC: "drafter>=2,<3"
+  DIAGNOSTIC_VENV: ".venv"
+  STUDENT_REQUIREMENTS: ".drafter-student-requirements.txt"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Retained for the course diagnostics/commit history below.
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Find main Python file
+        id: main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MAIN_FILE=""
+          for candidate in main.py Main.py app.py App.py; do
+            if [[ -f "$candidate" ]]; then
+              MAIN_FILE="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$MAIN_FILE" ]]; then
+            echo "No Drafter entry file found. Expected one of: main.py, Main.py, app.py, App.py" >&2
+            exit 1
+          fi
+
+          echo "main_file=$MAIN_FILE" >> "$GITHUB_OUTPUT"
+          echo "Using Drafter entry file: $MAIN_FILE"
+
+      - name: Prepare course diagnostics environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Preserve student requirements, but do not allow an old Drafter
+          # pin to replace the v2 version selected by this workflow.
+          : > "$STUDENT_REQUIREMENTS"
+          if [[ -f requirements.txt ]]; then
+            grep -Eiv '^[[:space:]]*drafter(\[[^]]*\])?([[:space:]<>=!~@;]|$)' \
+              requirements.txt > "$STUDENT_REQUIREMENTS" || true
+          fi
+
+          uv venv "$DIAGNOSTIC_VENV" --python 3.12
+
+          # Keep the course diagnostics in one environment. In particular,
+          # analyze_drafter_site imports mypy at runtime.
+          uv pip install --python "$DIAGNOSTIC_VENV/bin/python" \
+            "$DRAFTER_SPEC" \
+            coverage \
+            pylint \
+            mypy \
+            analyze-drafter-site \
+            bakery \
+            matplotlib \
+            pillow
+
+          if [[ -s "$STUDENT_REQUIREMENTS" ]]; then
+            uv pip install \
+              --python "$DIAGNOSTIC_VENV/bin/python" \
+              -r "$STUDENT_REQUIREMENTS"
+
+            # A nested -r file could contain an old Drafter constraint.
+            # Reassert the workflow's Drafter v2 requirement afterward.
+            uv pip install \
+              --python "$DIAGNOSTIC_VENV/bin/python" \
+              "$DRAFTER_SPEC"
+          fi
+
+          # Fail early if one of the required diagnostic tools was not
+          # installed correctly.
+          "$DIAGNOSTIC_VENV/bin/python" - <<'PY'
+          import coverage
+          import mypy
+          import pylint
+          import analyze_drafter_site
+
+          print("Coverage, MyPy, PyLint, and analyze_drafter_site are importable.")
+          PY
+
+      - name: Build Drafter v2 site
+        id: build_site
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MAIN_FILE="${{ steps.main.outputs.main_file }}"
+          BUILD_LOG="$RUNNER_TEMP/drafter-build.log"
+
+          # Drafter v2 accepts semicolon-separated --additional-paths and can
+          # copy both files and directories. Preserve the old workflow's
+          # convenient behavior of publishing the student's visible project
+          # files, while excluding build/configuration files.
+          ADDITIONAL_PATHS=()
+          shopt -s nullglob
+          for path in *; do
+            case "$path" in
+              "$MAIN_FILE"|requirements.txt|pyproject.toml|uv.lock|mypy.ini|_site|__pycache__)
+                continue
+                ;;
+            esac
+            ADDITIONAL_PATHS+=("$path")
+          done
+
+          # uvx gives Drafter its own disposable environment. If the student's
+          # project has requirements.txt, layer those packages into the same
+          # environment so imports needed while compiling can succeed.
+          DRAFTER_RUN=(uvx --from "$DRAFTER_SPEC")
+          if [[ -f requirements.txt ]]; then
+            # The workflow controls the Drafter major version. Ignore any
+            # Drafter pin in a legacy requirements.txt, but preserve the
+            # student's actual project dependencies.
+            FILTERED_REQUIREMENTS=".drafter-student-requirements.txt"
+            trap 'rm -f "$FILTERED_REQUIREMENTS"' EXIT
+            grep -Eiv '^[[:space:]]*drafter([[:space:]<>=!~@;]|$)' requirements.txt > "$FILTERED_REQUIREMENTS" || true
+            if [[ -s "$FILTERED_REQUIREMENTS" ]]; then
+              DRAFTER_RUN+=(--with-requirements "$FILTERED_REQUIREMENTS")
+            fi
+          fi
+
+          DRAFTER_RUN+=(
+            drafter "$MAIN_FILE"
+            --compile
+            --output-directory _site
+            --production
+          )
+
+          for path in "${ADDITIONAL_PATHS[@]}"; do
+            DRAFTER_RUN+=(--additional-paths "$path")
+          done
+
+          # Keep the course dashboard reachable from Drafter's generated
+          # auxiliary links without coupling the dashboard to the build itself.
+          DRAFTER_RUN+=(
+            --external-pages "dashboard/ Dashboard"
+            --external-pages "${{ github.server_url }}/${{ github.repository }} Repository"
+          )
+
+          {
+            echo "Drafter v2 deployment build"
+            echo "Repository: ${{ github.repository }}"
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "Entry file: $MAIN_FILE"
+            echo
+            printf 'Command:'
+            printf ' %q' "${DRAFTER_RUN[@]}"
+            echo
+            echo
+            "${DRAFTER_RUN[@]}"
+          } 2>&1 | tee "$BUILD_LOG"
+
+          # GitHub Pages should serve Drafter's generated static files as-is.
+          touch _site/.nojekyll
+
+          mkdir -p _site/dashboard
+          cp "$BUILD_LOG" _site/dashboard/build.log
+
+          # Drafter v2 assertions execute before start_server during compilation.
+          # Surface their SUCCESS/FAILURE lines without running the application a
+          # second time or relying on the removed v1 DRAFTER_SKIP mechanism.
+          grep -E 'SUCCESS|FAILURE' "$BUILD_LOG" > _site/dashboard/tests.txt || true
+          if [[ ! -s _site/dashboard/tests.txt ]]; then
+            echo "No Drafter assertion output was detected during compilation." > _site/dashboard/tests.txt
+          fi
+
+      - name: Run tests and output code coverage
+        id: coverage
+        shell: bash
+        env:
+          DRAFTER_SKIP: "true"
+        run: |
+          set -euo pipefail
+
+          MAIN_FILE="${{ steps.main.outputs.main_file }}"
+          mkdir -p _site/dashboard/coverage
+
+          "$DIAGNOSTIC_VENV/bin/python" -m coverage erase
+
+          "$DIAGNOSTIC_VENV/bin/python" -m coverage run "$MAIN_FILE" \
+             2>&1 | tee _site/dashboard/coverage.txt
+          
+          "$DIAGNOSTIC_VENV/bin/python" -m coverage html \
+             -d _site/dashboard/coverage \
+             2>&1 | tee -a _site/dashboard/coverage.txt
+      - name: Run linter
+        id: lint
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p _site/dashboard
+
+          shopt -s nullglob
+          PYTHON_FILES=(*.py)
+
+          if (( ${#PYTHON_FILES[@]} == 0 )); then
+            echo "No top-level Python files found." \
+              | tee _site/dashboard/lint.txt
+            exit 0
+          fi
+
+          "$DIAGNOSTIC_VENV/bin/python" -m pylint \
+            "${PYTHON_FILES[@]}" \
+            --exit-zero \
+            2>&1 | tee _site/dashboard/lint.txt
+      - name: Run type checker
+        id: typecheck
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+
+          MAIN_FILE="${{ steps.main.outputs.main_file }}"
+          MYPY_CONFIG="mypy.ini"
+
+          # Respect a student/instructor-provided config. Otherwise use the
+          # same Bakery compatibility rule as the previous workflow, without
+          # modifying the repository during the build.
+          if [[ ! -f "$MYPY_CONFIG" ]]; then
+            MYPY_CONFIG="$RUNNER_TEMP/drafter-mypy.ini"
+
+            cat > "$MYPY_CONFIG" <<'INI'
+          [mypy]
+
+          [mypy-bakery.*]
+          ignore_missing_imports = True
+          INI
+          fi
+
+          "$DIAGNOSTIC_VENV/bin/python" -m mypy \
+            --config-file "$MYPY_CONFIG" \
+            "$MAIN_FILE" \
+            2>&1 | tee _site/dashboard/type.txt
+
+      # Course-specific static analysis. This is not required by Drafter v2.
+      # It is kept because the previous workflow used it for grading support.
+      # The tool predates Drafter v2, so treat its report as advisory until its
+      # v2 compatibility has been validated for the constructs used in a course.
+      - name: Run Drafter site analysis
+        id: drafter_analysis
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          MAIN_FILE="${{ steps.main.outputs.main_file }}"
+          mkdir -p _site/dashboard/analysis
+          "$DIAGNOSTIC_VENV/bin/analyze_drafter_site" "$MAIN_FILE" \
+            --output-dir _site/dashboard/analysis \
+            --no-stdout \
+            2>&1 | tee _site/dashboard/analysis.log
+
+      - name: Record commit history
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          git log --oneline --decorate --graph --all -n 50 > _site/dashboard/commits.txt
+
+      - name: Create deployment dashboard
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          from html import escape
+          from pathlib import Path
+
+          dashboard = Path("_site/dashboard")
+          dashboard.mkdir(parents=True, exist_ok=True)
+
+          build_log = dashboard / "build.log"
+          build_text = build_log.read_text(encoding="utf-8", errors="replace") if build_log.exists() else "Build log unavailable."
+
+          analysis_link = ""
+          if (dashboard / "analysis" / "analysis.html").exists():
+              analysis_link = '<li><a href="analysis/analysis.html">Drafter Site Analysis</a>: course-specific static analysis.</li>'
+          elif (dashboard / "analysis.log").exists():
+              analysis_link = '<li><a href="analysis.log">Drafter Site Analysis Log</a>: analyzer output or failure details.</li>'
+
+          html = f"""<!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Deployment Dashboard</title>
+            <style>
+              body {{ max-width: 72rem; margin: 2rem auto; padding: 0 1rem; font-family: system-ui, sans-serif; line-height: 1.45; }}
+              pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #f5f5f5; padding: 1rem; }}
+              code {{ font-family: ui-monospace, monospace; }}
+            </style>
+          </head>
+          <body>
+            <h1>Deployment Dashboard</h1>
+            <p>This page contains course-oriented deployment diagnostics. GitHub Actions remains the authoritative deployment log.</p>
+            <h2>Quick links</h2>
+            <ul>
+              <li><a href="../">Deployed Site</a></li>
+              <li><a href="https://github.com/${{ github.repository }}">GitHub Repository</a></li>
+              <li><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">GitHub Actions Run</a></li>
+              <li><a href="tests.txt">Drafter Test Output</a></li>
+              <li><a href="coverage/index.html">Coverage Report</a></li>
+              <li><a href="lint.txt">PyLint Report</a></li>
+              <li><a href="type.txt">MyPy Report</a></li>
+              <li><a href="commits.txt">Recent Commit History</a></li>
+              {analysis_link}
+              <li><a href="build.log">Raw Build Log</a></li>
+            </ul>
+            <h2>Build log</h2>
+            <pre>{escape(build_text)}</pre>
+          </body>
+          </html>
+          """
+          (dashboard / "index.html").write_text(html, encoding="utf-8")
+          PY
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@main
+        with:
+          path: ./_site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
