@@ -28,6 +28,9 @@ from PIL import Image as PILImage
 
 from drafter import *
 
+# Drafter calls its visual divider component HorizontalRule.
+Divider = HorizontalRule
+
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.exceptions import InvalidTag
@@ -263,8 +266,9 @@ def to_png_bytes(image):
     return buffer.getvalue()
 
 
+
 # =============================================================================
-# PART 2: DRAFTER APP
+# PART 2: USER-FRIENDLY DRAFTER APP
 # =============================================================================
 
 @dataclass
@@ -277,7 +281,7 @@ class Payload:
     file_name: str
     file_data: bytes
     result: Picture | None
-    status: str  # "queued", "done", or an error message
+    status: str
 
 
 @dataclass
@@ -292,206 +296,417 @@ class State:
     extracted_file_data: bytes
 
 
-set_website_title("Steganography Tool")
+set_website_title("PixelVault | Image Message Hider")
+
+
+def section_title(title, description):
+    return [
+        Header(title),
+        description,
+        Divider(),
+    ]
 
 
 @route
 def index(state: State) -> Page:
     queued = len(state.payloads)
+
     content = [
-        Header("Steganography Tool"),
-        "Hide a message (or a small file) inside an image, then reveal it later.",
+        Header("PixelVault"),
+        Header("Hide messages inside images."),
+        "A simple way to hide private messages and small files inside "
+        "ordinary images.",
+        Divider(),
+
+        Header("What would you like to do?"),
+
+        Button("🔒 Hide a Message", encryption_method_select),
+        Button("🔍 Reveal a Message", extract_input),
+
+        Divider(),
+
+        Header("How does it work?"),
+        "1. Choose an image.",
+        "2. Write a message or upload a file.",
+        "3. Choose an encryption method.",
+        "4. Download your image with the hidden content.",
+
+        Divider(),
+
+        Header("Your privacy matters"),
+        "Your message is hidden inside the image's pixel data. "
+        "Optional encryption adds another layer of protection.",
+
         Pre(
-            "Heads up: this is a fun demo of how changing the least significant bit of "
-            "each color value is invisible to the eye. It is NOT real security. "
-            "Encryption protects what the message says; it does not hide that "
-            "a message exists."
+            "Important: This is an educational steganography tool. "
+            "Hidden messages may be detectable through statistical analysis. "
+            "Always use AES-256-GCM when encryption is needed.",
+            style="white-space: pre-wrap; overflow-wrap: anywhere;"
         ),
-        Button("Hide a message", encryption_method_select),
-        Button("Reveal a message", extract_input),
     ]
-    if queued > 0:
-        content.append(f"You have {queued} payload(s) waiting in your batch.")
-        content.append(Button("Embed everything in my batch", image_output))
+
+    if queued:
+        content.extend([
+            Divider(),
+            Header("Your pending images"),
+            f"You have {queued} message(s) waiting to be embedded.",
+            Button("Create my images", image_output),
+        ])
+
     return Page(state, content)
 
 
 @route
 def encryption_method_select(state: State) -> Page:
     return Page(state, [
-        Header("Step 1: Choose an encryption method"),
-        "Pick how your message is scrambled before it is hidden.",
+        Header("Step 1 of 3: Choose your protection"),
+        "How would you like to protect your message?",
+
+        Divider(),
+
+        Header("AES-256-GCM"),
+        "Recommended. Strong encryption that protects your message "
+        "and detects incorrect passwords or modifications.",
+
+        Header("XOR"),
+        "Educational option. Uses a basic XOR keystream and is NOT "
+        "secure for real-world use.",
+
+        Header("No encryption"),
+        "Your message will be hidden without a password.",
+
+        Divider(),
+
         SelectBox("method", METHODS, state.encryption_method),
+
         Button("Continue", save_method),
-        Button("Back", index),
+        Button("Back to Home", index),
     ])
 
 
 @route
 def save_method(state: State, method: str) -> Page:
-    if method == METHOD_NONE:
-        state.encryption_method = method
-    elif method == METHOD_XOR:
-        state.encryption_method = method
-    elif method == METHOD_AES:
-        state.encryption_method = method
-    else:
-        state.error = "That encryption method is not available."
+    if method not in METHODS:
+        state.error = "Please select a valid encryption method."
         return error_route(state)
+
+    state.encryption_method = method
     return image_input(state)
 
 
 @route
 def image_input(state: State) -> Page:
     return Page(state, [
-        Header("Step 2: Choose a cover image"),
-        f"Encryption: {state.encryption_method}",
-        "Upload the image that will hold your message. Photos with lots of detail "
-        "make the best covers. JPEGs are converted to PNG; the output is always PNG.",
+        Header("Step 2 of 3: Choose an image"),
+        "Select the image that will carry your hidden message.",
+
+        Divider(),
+
+        Header("Upload your cover image"),
+        "Choose a PNG, JPEG, or other supported image format.",
+        "Your finished image will always be saved as PNG.",
+
         FileUpload("upload", accept="image/*"),
-        Button("Use this image", save_image),
-        Button("Back", encryption_method_select),
+
+        Divider(),
+
+        Button("Continue", save_image),
+        Button("Go Back", encryption_method_select),
     ])
 
 
 @route
 def save_image(state: State, upload: Picture | None) -> Page:
     if upload is None:
-        state.error = "No image was chosen."
+        state.error = "Please select an image before continuing."
         return error_route(state)
 
-    pil = upload.to_pil()
-    if pil.width * pil.height > MAX_PIXELS:
-        state.error = "That image is too large (over 25 megapixels). Pick a smaller one."
-        return error_route(state)
-    if capacity_bytes(pil.width, pil.height, state.encryption_method) < 1:
-        state.error = "That image is too small to hold anything."
+    try:
+        pil = upload.to_pil()
+
+        if pil.width * pil.height > MAX_PIXELS:
+            state.error = "This image is too large. Please choose an image "
+            state.error += "smaller than 25 megapixels."
+            return error_route(state)
+
+        if capacity_bytes(
+            pil.width, pil.height, state.encryption_method
+        ) < 1:
+            state.error = "This image is too small to store a message."
+            return error_route(state)
+
+        state.image = Picture(pil.convert("RGB"))
+
+    except Exception:
+        state.error = "We couldn't open that image. Please try another file."
         return error_route(state)
 
-    state.image = Picture(pil.convert("RGB"))
     return message_input(state)
 
 
 def capacity_summary(state, message):
-    """Return (used, capacity) in bytes for the current message."""
     pil = state.image.to_pil()
-    capacity = capacity_bytes(pil.width, pil.height, state.encryption_method)
+
+    capacity = capacity_bytes(
+        pil.width,
+        pil.height,
+        state.encryption_method
+    )
+
     _, packed = pack_plaintext(message, "", b"")
+
     return len(packed), capacity
 
 
 @route
 def message_input(state: State) -> Page:
     if state.image is None:
-        state.error = "Choose an image first."
+        state.error = "Please upload an image first."
         return error_route(state)
 
     used, capacity = capacity_summary(state, state.message)
-    percent = 0 if capacity == 0 else min(100, round(100 * used / capacity))
-    status = f"Using about {used} of {capacity} available bytes ({percent}%)."
+
+    percent = (
+        0 if capacity == 0
+        else min(100, round(100 * used / capacity))
+    )
+
     if used > capacity:
-        status = f"Too large: {used - capacity} bytes over the limit. " + status
+        status = (
+            f"Your message is {used - capacity} bytes "
+            "over the available limit."
+        )
+    else:
+        status = (
+            f"Your message uses approximately {used} "
+            f"of {capacity} available bytes."
+        )
 
     return Page(state, [
-        Header("Step 3: Write your message"),
-        Image(state.image, width=300),
-        status,
-        Meter(min(used, capacity), min=0, max=max(capacity, 1)),
-        "Message (compressed before encryption, so repetitive text takes less room):",
+        Header("Step 3 of 3: Add your message"),
+
+        "Your image is ready. Now decide what you want to hide.",
+
+        Divider(),
+
+        Header("Image preview"),
+        Image(state.image, width=400),
+
+        f"Selected encryption: {state.encryption_method}",
+
+        Divider(),
+
+        Header("Write your message"),
+        "Type the text you want to hide inside your image.",
+
         TextArea("message", state.message),
-        "Optional: hide a file instead of the message above.",
+
+        Divider(),
+
+        Header("Or attach a file"),
+        "Optional: Upload a small file instead of hiding text.",
+
         FileUpload("attachment"),
-        "Password:",
+
+        Divider(),
+
+        Header("Password protection"),
+        "Enter a password if your selected encryption method "
+        "requires one. You will need the same password to reveal "
+        "your message later.",
+
         TextBox("password", "", kind="password"),
-        Button("Check capacity", check_capacity),
-        Button("Add to batch", add_payload),
-        Button("Back", image_input),
+
+        Divider(),
+
+        Header("Storage capacity"),
+        status,
+        Meter(
+            min(used, capacity),
+            min=0,
+            max=max(capacity, 1)
+        ),
+
+        Button("Check storage capacity", check_capacity),
+        Button("Add to my images", add_payload),
+        Button("Choose another image", image_input),
     ])
 
 
 @route
-def check_capacity(state: State, message: str, attachment: DrafterBinaryFile | None,
-                   password: str) -> Page:
+def check_capacity(
+    state: State,
+    message: str,
+    attachment: DrafterBinaryFile | None,
+    password: str
+) -> Page:
     state.message = message
+
     return message_input(state)
 
 
 @route
-def add_payload(state: State, message: str, attachment: DrafterBinaryFile | None,
-                password: str) -> Page:
-    state.message = message
-    has_file = attachment is not None and len(attachment.content) > 0
+def add_payload(
+    state: State,
+    message: str,
+    attachment: DrafterBinaryFile | None,
+    password: str
+) -> Page:
 
-    if not has_file and message == "":
-        state.error = "Type a message or attach a file."
+    state.message = message
+
+    has_file = (
+        attachment is not None
+        and len(attachment.content) > 0
+    )
+
+    if not has_file and not message.strip():
+        state.error = "Please enter a message or attach a file."
         return error_route(state)
-    if state.encryption_method != METHOD_NONE and password == "":
-        state.error = "Enter a password for this encryption method."
+
+    if state.image is None:
+        state.error = "Please upload an image first."
+        return error_route(state)
+
+    if state.encryption_method != METHOD_NONE and not password:
+        state.error = "Please enter a password to protect your message."
         return error_route(state)
 
     file_name = attachment.filename if has_file else ""
     file_data = attachment.content if has_file else b""
 
-    # Dry-run packing + capacity check now so the user finds out immediately.
     pil = state.image.to_pil()
-    kind, packed = pack_plaintext(message, file_name, file_data)
+
+    _, packed = pack_plaintext(message, file_name, file_data)
+
     needed = len(packed) + overhead_for(state.encryption_method)
-    room = capacity_bytes(pil.width, pil.height, state.encryption_method) \
+
+    room = (
+        capacity_bytes(
+            pil.width,
+            pil.height,
+            state.encryption_method
+        )
         + overhead_for(state.encryption_method)
+    )
+
     if needed > room:
-        state.error = (f"Payload is {needed - room} bytes too large for this image "
-                       f"({needed} needed, {room} available).")
+        state.error = (
+            f"Your content is {needed - room} bytes "
+            "too large for this image. Try a larger image "
+            "or a smaller message."
+        )
         return error_route(state)
 
-    state.payloads.append(Payload(message, state.image, state.encryption_method,
-                                  password, file_name, file_data, None, "queued"))
+    state.payloads.append(
+        Payload(
+            message,
+            state.image,
+            state.encryption_method,
+            password,
+            file_name,
+            file_data,
+            None,
+            "queued"
+        )
+    )
+
     state.message = ""
     state.image = None
+
     return Page(state, [
-        Header("Added to batch"),
-        f"You now have {len(state.payloads)} payload(s) queued.",
-        Button("Add another", encryption_method_select),
-        Button("Embed everything", image_output),
+        Header("Your message is ready!"),
+
+        "Your content has been added to the processing queue.",
+
+        f"Messages waiting: {len(state.payloads)}",
+
+        Divider(),
+
+        Button("Add another message", encryption_method_select),
+        Button("Create my hidden images", image_output),
+        Button("Return Home", index),
     ])
 
 
 @route
 def image_output(state: State) -> Page:
-    if len(state.payloads) == 0:
-        state.error = "Your batch is empty."
+    if not state.payloads:
+        state.error = "There are no messages waiting to be embedded."
         return error_route(state)
 
-    content = [Header("Your images")]
+    content = [
+        Header("Your hidden images"),
+        "Your images have been processed. Download each PNG below.",
+        Divider(),
+    ]
+
     for number, payload in enumerate(state.payloads, start=1):
         try:
-            result = embed(payload.image.to_pil(), payload.message, payload.file_name,
-                           payload.file_data, payload.password, payload.encryption_method)
+            result = embed(
+                payload.image.to_pil(),
+                payload.message,
+                payload.file_name,
+                payload.file_data,
+                payload.password,
+                payload.encryption_method
+            )
 
-            # Verify against the encoded PNG (what the user will actually download).
             png = to_png_bytes(result)
+
             reloaded = PILImage.open(io.BytesIO(png))
-            text, name, data = extract(reloaded, payload.password)
+
+            text, name, data = extract(
+                reloaded,
+                payload.password
+            )
+
             if text != payload.message or data != payload.file_data:
-                raise StegoError("Verification failed: the saved image did not round-trip.")
+                raise StegoError(
+                    "Verification failed. The saved image "
+                    "could not be read back correctly."
+                )
 
             payload.result = Picture(png)
             payload.status = "done"
-        except StegoError as problem:
+
+        except Exception as problem:
             payload.status = f"Failed: {problem}"
 
-        content.append(Header(f"Image {number}", 2))
-        content.append(f"Encryption: {payload.encryption_method}")
+        content.extend([
+            Header(f"Image {number}", 2),
+            f"Encryption: {payload.encryption_method}",
+            Divider(),
+        ])
+
         if payload.status == "done":
-            content.append(Image(payload.result, width=400))
-            content.append(Download(f"Download image {number} (PNG)",
-                                    f"hidden_{number}.png", payload.result))
-            content.append("Verified: extracted the message back from the saved PNG.")
+            content.extend([
+                Image(payload.result, width=400),
+
+                "Your hidden content was successfully verified.",
+
+                Download(
+                    f"Download PNG #{number}",
+                    f"hidden_{number}.png",
+                    payload.result
+                ),
+
+                Divider(),
+            ])
         else:
             content.append(payload.status)
 
-    content.append("Never post or reuse your original image: comparing it to the "
-                   "output reveals where bits were changed.")
-    content.append(Button("Finish", finished))
+    content.extend([
+        Header("Important reminder"),
+
+        "Always send the finished PNG as a file or document. "
+        "Do not convert it to JPEG or send it through services "
+        "that compress images, because this can destroy the "
+        "hidden information.",
+
+        Button("Finish", finished),
+    ])
+
     return Page(state, content)
 
 
@@ -500,35 +715,65 @@ def finished(state: State) -> Page:
     state.payloads = []
     state.image = None
     state.message = ""
+
     return Page(state, [
-        Header("All done"),
-        "Remember: send the PNG as a file. Re-compression will destroy the message.",
-        Button("Start over", index),
+        Header("All finished!"),
+
+        "Your hidden images are ready. Keep your password safe "
+        "and remember that the original image should not be "
+        "shared alongside the modified image.",
+
+        Button("Start Again", index),
     ])
 
 
-# ---- Extraction ----
+# =============================================================================
+# REVEAL HIDDEN CONTENT
+# =============================================================================
 
 @route
 def extract_input(state: State) -> Page:
     return Page(state, [
         Header("Reveal a hidden message"),
-        "Upload a PNG that was made with this tool.",
+
+        "Upload an image created with PixelVault to recover "
+        "its hidden message or file.",
+
+        Divider(),
+
+        Header("Select your image"),
         FileUpload("upload", accept="image/png"),
-        "Password (leave blank if none was used):",
+
+        Divider(),
+
+        Header("Enter your password"),
+        "If the image was encrypted, enter the original password. "
+        "Leave blank if encryption was not used.",
+
         TextBox("password", "", kind="password"),
-        Button("Reveal", extract_result),
-        Button("Back", index),
+
+        Button("Reveal Hidden Content", extract_result),
+        Button("Back to Home", index),
     ])
 
 
 @route
-def extract_result(state: State, upload: Picture | None, password: str) -> Page:
+def extract_result(
+    state: State,
+    upload: Picture | None,
+    password: str
+) -> Page:
+
     if upload is None:
-        state.error = "No image was chosen."
+        state.error = "Please upload an image first."
         return error_route(state)
+
     try:
-        text, name, data = extract(upload.to_pil(), password)
+        text, name, data = extract(
+            upload.to_pil(),
+            password
+        )
+
     except StegoError as problem:
         state.error = str(problem)
         return error_route(state)
@@ -537,29 +782,75 @@ def extract_result(state: State, upload: Picture | None, password: str) -> Page:
     state.extracted_file_name = name
     state.extracted_file_data = data
 
-    content = [Header("Hidden content found")]
-    if name != "":
+    content = [
+        Header("Hidden content successfully recovered!"),
+        Divider(),
+    ]
+
+    if name:
         safe_name = os.path.basename(name) or "extracted_file"
-        content.append(f"A file was hidden here: {safe_name} ({len(data)} bytes)")
-        content.append(Download("Download the file", safe_name, data,
-                                content_type="application/octet-stream"))
+
+        content.extend([
+            Header("Recovered file"),
+            f"Filename: {safe_name}",
+            f"File size: {len(data)} bytes",
+
+            Download(
+                "Download recovered file",
+                safe_name,
+                data,
+                content_type="application/octet-stream"
+            ),
+        ])
+
     else:
-        content.append(Pre(text))
-    content.append(Button("Home", index))
+        content.extend([
+            Header("Your recovered message"),
+            Pre(text),
+        ])
+
+    content.extend([
+        Divider(),
+        Button("Reveal another image", extract_input),
+        Button("Return Home", index),
+    ])
+
     return Page(state, content)
 
 
-# ---- Errors ----
+# =============================================================================
+# ERROR HANDLING
+# =============================================================================
 
 @route
 def error_route(state: State) -> Page:
     message = state.error
     state.error = ""
+
     return Page(state, [
         Header("Something went wrong"),
+
         message,
-        Button("Back to start", index),
+
+        Divider(),
+
+        "Please check your input and try again.",
+
+        Button("Return Home", index),
     ])
 
+
 hide_debug_information()
-start_server(State(METHODS[0], None, "", [], "", "", "", b""))
+
+start_server(
+    State(
+        METHODS[0],
+        None,
+        "",
+        [],
+        "",
+        "",
+        "",
+        b""
+    )
+)
