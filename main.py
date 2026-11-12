@@ -289,6 +289,9 @@ class State:
     encryption_method: str
     image: Picture | None
     message: str
+    password: str
+    file_name: str
+    file_data: bytes
     payloads: list[Payload]
     error: str
     extracted_text: str
@@ -436,6 +439,8 @@ def save_image(state: State, upload: Picture | None) -> Page:
             return error_route(state)
 
         state.image = Picture(pil.convert("RGB"))
+        state.file_name = ""
+        state.file_data = b""
 
     except Exception:
         state.error = "We couldn't open that image. Please try another file."
@@ -453,7 +458,11 @@ def capacity_summary(state, message):
         state.encryption_method
     )
 
-    _, packed = pack_plaintext(message, "", b"")
+    _, packed = pack_plaintext(
+        message,
+        state.file_name,
+        state.file_data
+    )
 
     return len(packed), capacity
 
@@ -478,7 +487,7 @@ def message_input(state: State) -> Page:
         )
     else:
         status = (
-            f"Your message uses approximately {used} "
+            f"Your content uses approximately {used} "
             f"of {capacity} available bytes."
         )
 
@@ -515,7 +524,7 @@ def message_input(state: State) -> Page:
         "requires one. You will need the same password to reveal "
         "your message later.",
 
-        TextBox("password", "", kind="password"),
+        TextBox("password", state.password, kind="password"),
 
         Divider(),
 
@@ -541,6 +550,10 @@ def check_capacity(
     password: str
 ) -> Page:
     state.message = message
+    state.password = password
+    if attachment is not None and len(attachment.content) > 0:
+        state.file_name = attachment.filename
+        state.file_data = attachment.content
 
     return message_input(state)
 
@@ -554,11 +567,20 @@ def add_payload(
 ) -> Page:
 
     state.message = message
+    state.password = password
 
     has_file = (
         attachment is not None
         and len(attachment.content) > 0
     )
+
+    if has_file:
+        file_name = attachment.filename
+        file_data = attachment.content
+    else:
+        file_name = state.file_name
+        file_data = state.file_data
+        has_file = len(file_data) > 0
 
     if not has_file and not message.strip():
         state.error = "Please enter a message or attach a file."
@@ -571,9 +593,6 @@ def add_payload(
     if state.encryption_method != METHOD_NONE and not password:
         state.error = "Please enter a password to protect your message."
         return error_route(state)
-
-    file_name = attachment.filename if has_file else ""
-    file_data = attachment.content if has_file else b""
 
     pil = state.image.to_pil()
 
@@ -612,6 +631,9 @@ def add_payload(
     )
 
     state.message = ""
+    state.password = ""
+    state.file_name = ""
+    state.file_data = b""
     state.image = None
 
     return Page(state, [
@@ -661,7 +683,16 @@ def image_output(state: State) -> Page:
                 payload.password
             )
 
-            if text != payload.message or data != payload.file_data:
+            if payload.file_data:
+                verified = (
+                    text == ""
+                    and name == payload.file_name
+                    and data == payload.file_data
+                )
+            else:
+                verified = text == payload.message and not name and not data
+
+            if not verified:
                 raise StegoError(
                     "Verification failed. The saved image "
                     "could not be read back correctly."
@@ -715,6 +746,9 @@ def finished(state: State) -> Page:
     state.payloads = []
     state.image = None
     state.message = ""
+    state.password = ""
+    state.file_name = ""
+    state.file_data = b""
 
     return Page(state, [
         Header("All finished!"),
@@ -847,6 +881,9 @@ start_server(
         METHODS[0],
         None,
         "",
+        "",
+        "",
+        b"",
         [],
         "",
         "",
